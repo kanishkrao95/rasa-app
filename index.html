@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+<meta name="theme-color" content="#1A6B4A"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="default"/>
+<meta name="apple-mobile-web-app-title" content="Rasa"/>
+<title>Rasa — Your morning is handled</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+html,body{height:100%;background:#FAF8F3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;overscroll-behavior:none;}
+input,textarea,button{font-family:inherit;}
+#root{max-width:430px;margin:0 auto;min-height:100vh;min-height:100dvh;background:#FAF8F3;}
+@keyframes pulse{0%,100%{opacity:.3;transform:scale(0.8)}50%{opacity:1;transform:scale(1.2)}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.fade{animation:fadeUp 0.3s ease forwards;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useCallback}=React;
+
+// ── Config ────────────────────────────────────────────────────────
+const API_KEY="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";
+
+const C={
+  green:"#1A6B4A",greenLight:"#E8F5EE",greenMid:"#2D8A5F",
+  cream:"#FAF8F3",stone:"#2C2B27",muted:"#7A7870",
+  border:"rgba(44,43,39,0.12)",card:"#FFFFFF",
+};
+const NC={
+  light:{label:"Light",bg:"#EBF4FF",text:"#1A4E7A"},
+  balanced:{label:"Balanced",bg:"#E8F5EE",text:"#1A6B4A"},
+  protein:{label:"Protein-rich",bg:"#F3EEFF",text:"#5B2D8E"},
+  filling:{label:"Filling",bg:"#FDF3E3",text:"#C47B15"},
+};
+
+// ── Storage ───────────────────────────────────────────────────────
+const store={
+  get:(k)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):null;}catch{return null;}},
+  set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch{}},
+};
+
+// ── Claude API — direct call with correct headers ─────────────────
+// Safari on iPhone allows direct API calls when the server sends
+// the right CORS headers. Anthropic's API does allow browser calls
+// when you pass the special header below.
+async function callClaude(system,user){
+  const res=await fetch("https://api.anthropic.com/v1/messages",{
+    method:"POST",
+    headers:{
+      "Content-Type":"application/json",
+      "x-api-key":API_KEY,
+      "anthropic-version":"2023-06-01",
+      "anthropic-dangerous-direct-browser-access":"true"
+    },
+    body:JSON.stringify({
+      model:"claude-haiku-4-5-20251001",
+      max_tokens:1000,
+      system,
+      messages:[{role:"user",content:user}]
+    })
+  });
+  if(!res.ok){
+    const err=await res.text();
+    throw new Error("API error "+res.status+": "+err);
+  }
+  const d=await res.json();
+  if(d.error) throw new Error(d.error.message||"API error");
+  return d.content?.[0]?.text||"";
+}
+
+async function generatePlan(hh,hist=[]){
+  const histText=hist.length
+    ?hist.slice(-14).map(h=>`${h.date} ${h.slot}: ${h.dish}`).join("\n")
+    :"No history yet — this is their first plan.";
+  const sys=`You are Rasa, a warm meal planning assistant for Indian households. You know this family deeply. Suggest breakfast, lunch, dinner for tomorrow. Return ONLY valid JSON, nothing else. No markdown, no explanation.`;
+  const prompt=`HOUSEHOLD:
+Name: ${hh.familyName||"the household"}
+Size: ${hh.size} people
+Diet: ${hh.dietType}
+Dietary notes: ${hh.dietaryNotes||"none"}
+Cuisine: ${hh.cuisinePrimary}
+Week rhythm: ${(hh.weekRhythm||[]).join(", ")||"standard"}
+Health goal: ${hh.healthAmbition||"eat well"}
+Loves more of: ${hh.lovesMoreOf||"variety"}
+Never suggest: ${[hh.neverSuggest,...(hh.neverSuggestTags||[])].filter(Boolean).join(", ")||"nothing"}
+Cook: ${hh.hasCook===true?`Yes arrives ${hh.cookArrivalTime||"8am"}, good at: ${hh.cookStrengths||"general"}, avoid: ${hh.cookWeaknesses||"nothing"}`:hh.hasCook==="sometimes"?"Sometimes has cook":"No cook"}
+Today: ${new Date().toLocaleDateString("en-IN",{weekday:"long",month:"long",day:"numeric"})}
+
+RECENT MEALS:
+${histText}
+
+Rules: no repeat from last 7 days, respect diet, honour health goal, under 35min weekdays.
+
+Return ONLY:
+{"breakfast":{"name":"...","prepMins":20,"nutrition":"light|balanced|protein|filling","why":"one warm personal sentence"},"lunch":{"name":"...","prepMins":35,"nutrition":"...","why":"..."},"dinner":{"name":"...","prepMins":30,"nutrition":"...","why":"..."}}`;
+  const raw=await callClaude(sys,prompt);
+  const clean=raw.replace(/```json|```/g,"").trim();
+  return JSON.parse(clean);
+}
+
+async function getAlt(currentName,slot,hh,hist,exclude){
+  const sys=`You are Rasa. Return ONLY valid JSON, no markdown, no explanation.`;
+  const prompt=`Suggest ONE Indian meal alternative to "${currentName}" for ${slot}.
+Diet: ${hh.dietType}, Cuisine: ${hh.cuisinePrimary}
+Health goal: ${hh.healthAmbition||"eat well"}
+Never suggest: ${[hh.neverSuggest,...(hh.neverSuggestTags||[])].filter(Boolean).join(", ")||"nothing"}
+Do NOT suggest any of these: ${[...hist.slice(-7).map(h=>h.dish),...exclude,currentName].join(", ")}
+
+Return ONLY: {"name":"...","prepMins":20,"nutrition":"light|balanced|protein|filling","why":"one warm sentence"}`;
+  const raw=await callClaude(sys,prompt);
+  const clean=raw.replace(/```json|```/g,"").trim();
+  return JSON.parse(clean);
+}
+
+// ── UI helpers ────────────────────────────────────────────────────
+function Tag({children,bg,text}){
+  return <span style={{background:bg,color:text,fontSize:11,fontWeight:500,padding:"2px 9px",borderRadius:20,display:"inline-block",whiteSpace:"nowrap"}}>{children}</span>;
+}
+function Btn({children,onClick,variant="primary",disabled}){
+  const styles={
+    primary:{background:C.green,color:"#fff",border:"none"},
+    ghost:{background:"transparent",color:C.green,border:`1.5px solid ${C.green}`},
+    subtle:{background:C.greenLight,color:C.green,border:"none"},
+  };
+  return(
+    <button onClick={onClick} disabled={disabled} style={{
+      ...styles[variant],padding:"15px 24px",borderRadius:14,fontSize:15,
+      fontWeight:500,cursor:disabled?"not-allowed":"pointer",
+      width:"100%",opacity:disabled?.5:1,transition:"all .15s"
+    }}>{children}</button>
+  );
+}
+function Pill({children,active,onClick}){
+  return(
+    <button onClick={onClick} style={{
+      padding:"10px 16px",borderRadius:24,fontSize:13,
+      fontWeight:active?500:400,
+      border:`1.5px solid ${active?C.green:C.border}`,
+      background:active?C.greenLight:"#fff",
+      color:active?C.green:C.stone,
+      cursor:"pointer",transition:"all .15s",whiteSpace:"nowrap"
+    }}>{children}</button>
+  );
+}
+function Dots({total,current}){
+  return(
+    <div style={{display:"flex",gap:6,justifyContent:"center",marginBottom:12}}>
+      {Array.from({length:total}).map((_,i)=>(
+        <div key={i} style={{width:i===current?20:6,height:6,borderRadius:3,background:i===current?C.green:C.border,transition:"all .3s"}}/>
+      ))}
+    </div>
+  );
+}
+const iStyle=(extra={})=>({width:"100%",padding:"13px 14px",borderRadius:12,border:`1.5px solid ${C.border}`,fontSize:14,color:C.stone,background:"#fff",outline:"none",...extra});
+
+// ── Onboarding ────────────────────────────────────────────────────
+function OFrame({step,title,sub,children,onNext,onBack,canNext}){
+  return(
+    <div style={{minHeight:"100dvh",background:C.cream,display:"flex",flexDirection:"column",padding:"0 22px"}}>
+      <div style={{paddingTop:20}}><Dots total={9} current={step-1}/></div>
+      <div style={{flex:1,paddingBottom:130,overflowY:"auto"}}>
+        <div style={{fontSize:22,fontWeight:600,color:C.stone,marginBottom:6,lineHeight:1.3,marginTop:8}}>{title}</div>
+        <div style={{fontSize:14,color:C.muted,marginBottom:24,lineHeight:1.5}}>{sub}</div>
+        {children}
+      </div>
+      <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,padding:"12px 22px 40px",background:`linear-gradient(transparent,${C.cream} 25%)`,display:"flex",gap:10}}>
+        {step>1&&<button onClick={onBack} style={{padding:"15px 18px",borderRadius:14,fontSize:15,border:`1.5px solid ${C.border}`,background:"transparent",color:C.muted,cursor:"pointer",flexShrink:0}}>←</button>}
+        <Btn onClick={onNext} disabled={!canNext}>Continue →</Btn>
+      </div>
+    </div>
+  );
+}
+
+function Onboarding({step,data,setData,onNext,onBack}){
+  const s=data;
+  if(step===0) return(
+    <div style={{minHeight:"100dvh",background:C.cream,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"0 28px",textAlign:"center"}}>
+      <div style={{marginBottom:40}}>
+        <div style={{fontSize:58,fontWeight:700,color:C.green,letterSpacing:"-3px",marginBottom:14}}>rasa</div>
+        <div style={{fontSize:19,color:C.stone,marginBottom:14}}>Your morning is handled.</div>
+        <div style={{fontSize:14,color:C.muted,lineHeight:1.75,maxWidth:280}}>Rasa learns your household and takes care of the daily food decisions. The first time takes 4 minutes. After that — your mornings are free.</div>
+      </div>
+      <div style={{width:"100%",maxWidth:300}}>
+        <Btn onClick={onNext}>Let's begin →</Btn>
+        <div style={{marginTop:12,fontSize:12,color:C.muted}}>4 minutes · 8 questions</div>
+      </div>
+    </div>
+  );
+  if(step===1) return(
+    <OFrame step={step} title="Who are we feeding?" sub="So Rasa can speak to your household personally." onNext={()=>{if(s.size)onNext();}} onBack={onBack} canNext={!!s.size}>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:20}}>
+        {["Just me","2 of us","3 people","4 people","5 people","6+"].map((opt,i)=>(
+          <Pill key={opt} active={s.size===i+1} onClick={()=>setData(d=>({...d,size:i+1,sizeLabel:opt}))}>{opt}</Pill>
+        ))}
+      </div>
+      {s.size&&s.size>=2&&(
+        <div>
+          <div style={{fontSize:13,color:C.muted,marginBottom:8}}>What do you call your household? (optional)</div>
+          <input placeholder="e.g. The Sharma family, just us..." value={s.familyName||""} onChange={e=>setData(d=>({...d,familyName:e.target.value}))} style={iStyle()}/>
+        </div>
+      )}
+    </OFrame>
+  );
+  if(step===2) return(
+    <OFrame step={step} title="Any rules the kitchen runs by?" sub="Select everything that applies." onNext={onNext} onBack={onBack} canNext={!!s.dietType}>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {[{k:"veg",l:"We're vegetarian"},{k:"jain",l:"Jain — no root vegetables"},{k:"no-og",l:"No onion or garlic"},{k:"egg",l:"Eggs are fine, meat isn't"},{k:"nonveg",l:"We eat everything"}].map(o=>(
+          <button key={o.k} onClick={()=>setData(d=>({...d,dietType:o.k}))} style={{padding:"14px 16px",borderRadius:14,fontSize:14,textAlign:"left",cursor:"pointer",border:`1.5px solid ${s.dietType===o.k?C.green:C.border}`,background:s.dietType===o.k?C.greenLight:"#fff",color:s.dietType===o.k?C.green:C.stone,fontWeight:s.dietType===o.k?500:400}}>{o.l}</button>
+        ))}
+      </div>
+      <div style={{marginTop:16}}>
+        <div style={{fontSize:13,color:C.muted,marginBottom:8}}>Anyone with a health condition? (diabetes, BP, allergies...)</div>
+        <textarea placeholder="Tell us — this shapes every suggestion..." value={s.dietaryNotes||""} onChange={e=>setData(d=>({...d,dietaryNotes:e.target.value}))} rows={3} style={iStyle({resize:"none"})}/>
+      </div>
+    </OFrame>
+  );
+  if(step===3) return(
+    <OFrame step={step} title="What does home cooking feel like in your kitchen?" sub="Pick the one that's closest." onNext={onNext} onBack={onBack} canNext={!!s.cuisinePrimary}>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {[{k:"north",l:"North Indian",d:"Roti, sabzi, dal, rice"},{k:"south",l:"South Indian",d:"Rice, sambar, dosas"},{k:"gujarati",l:"Gujarati",d:"Light, a little sweet"},{k:"bengali",l:"Bengali",d:"Fish, mustard, rice"},{k:"punjabi",l:"Punjabi",d:"Rich, hearty, lots of ghee"},{k:"mixed",l:"A mix of everything",d:"We adapt"}].map(o=>(
+          <button key={o.k} onClick={()=>setData(d=>({...d,cuisinePrimary:o.k}))} style={{padding:"14px 16px",borderRadius:14,fontSize:14,textAlign:"left",cursor:"pointer",border:`1.5px solid ${s.cuisinePrimary===o.k?C.green:C.border}`,background:s.cuisinePrimary===o.k?C.greenLight:"#fff",color:C.stone,display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+            <span style={{fontWeight:s.cuisinePrimary===o.k?500:400,color:s.cuisinePrimary===o.k?C.green:C.stone}}>{o.l}</span>
+            <span style={{fontSize:12,color:C.muted,flexShrink:0}}>{o.d}</span>
+          </button>
+        ))}
+      </div>
+    </OFrame>
+  );
+  if(step===4) return(
+    <OFrame step={step} title="Does your week have a food rhythm?" sub="Select all that feel true." onNext={onNext} onBack={onBack} canNext={true}>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {[{k:"weekend_indulgent",l:"Weekdays light, weekends indulgent"},{k:"sunday_special",l:"Sunday is always something special"},{k:"tiffin",l:"Tiffin goes to office — lunch must travel"},{k:"fast_days",l:"We fast on certain days"},{k:"kids_lunch",l:"Kids home for lunch on school days"},{k:"no_rhythm",l:"No pattern — we just go with it"}].map(o=>{
+          const sel=(s.weekRhythm||[]).includes(o.k);
+          return <button key={o.k} onClick={()=>setData(d=>{const c=d.weekRhythm||[];return{...d,weekRhythm:sel?c.filter(x=>x!==o.k):[...c,o.k]};})} style={{padding:"14px 16px",borderRadius:14,fontSize:14,textAlign:"left",cursor:"pointer",border:`1.5px solid ${sel?C.green:C.border}`,background:sel?C.greenLight:"#fff",color:sel?C.green:C.stone,fontWeight:sel?500:400}}>{o.l}</button>;
+        })}
+      </div>
+    </OFrame>
+  );
+  if(step===5) return(
+    <OFrame step={step} title="What do you wish appeared on your plate more often?" sub="This becomes a standing instruction for Rasa every day." onNext={()=>{if(s.lovesMoreOf?.trim())onNext();}} onBack={onBack} canNext={!!s.lovesMoreOf?.trim()}>
+      <textarea placeholder="e.g. More protein — we keep defaulting to carbs. More vegetables especially at dinner. My husband loves fish but I never plan for it..." value={s.lovesMoreOf||""} onChange={e=>setData(d=>({...d,lovesMoreOf:e.target.value}))} rows={5} autoFocus style={iStyle({resize:"none",lineHeight:1.6})}/>
+    </OFrame>
+  );
+  if(step===6) return(
+    <OFrame step={step} title="Anything we should never put on the table?" sub="Dislikes, intolerances, or things that just don't work here." onNext={onNext} onBack={onBack} canNext={true}>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16}}>
+        {["Karela","Mushrooms","Too spicy","Broccoli","Capsicum","Cauliflower","No beef","No pork"].map(item=>{
+          const sel=(s.neverSuggestTags||[]).includes(item);
+          return <Pill key={item} active={sel} onClick={()=>setData(d=>{const c=d.neverSuggestTags||[];return{...d,neverSuggestTags:sel?c.filter(x=>x!==item):[...c,item]};})}>{item}</Pill>;
+        })}
+      </div>
+      <textarea placeholder="Anything else?" value={s.neverSuggest||""} onChange={e=>setData(d=>({...d,neverSuggest:e.target.value}))} rows={3} style={iStyle({resize:"none"})}/>
+    </OFrame>
+  );
+  if(step===7) return(
+    <OFrame step={step} title="Do you have a cook who comes in the morning?" sub="This shapes how Rasa plans each day." onNext={onNext} onBack={onBack} canNext={s.hasCook!==undefined}>
+      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+        {[{k:true,l:"Yes — every morning"},{k:"sometimes",l:"Sometimes"},{k:false,l:"No — we cook ourselves"}].map(o=>(
+          <button key={String(o.k)} onClick={()=>setData(d=>({...d,hasCook:o.k}))} style={{padding:"14px 16px",borderRadius:14,fontSize:14,textAlign:"left",cursor:"pointer",border:`1.5px solid ${s.hasCook===o.k?C.green:C.border}`,background:s.hasCook===o.k?C.greenLight:"#fff",color:s.hasCook===o.k?C.green:C.stone,fontWeight:s.hasCook===o.k?500:400}}>{o.l}</button>
+        ))}
+      </div>
+      {s.hasCook&&(
+        <div style={{marginTop:16,display:"flex",flexDirection:"column",gap:12}}>
+          <div>
+            <div style={{fontSize:13,color:C.muted,marginBottom:6}}>What time do they arrive?</div>
+            <input type="time" value={s.cookArrivalTime||"08:00"} onChange={e=>setData(d=>({...d,cookArrivalTime:e.target.value}))} style={{padding:"13px 14px",borderRadius:12,border:`1.5px solid ${C.border}`,fontSize:14,color:C.stone,outline:"none",background:"#fff"}}/>
+          </div>
+          <div>
+            <div style={{fontSize:13,color:C.muted,marginBottom:6}}>What do they make really well?</div>
+            <input placeholder="e.g. Great with dal and sabzi..." value={s.cookStrengths||""} onChange={e=>setData(d=>({...d,cookStrengths:e.target.value}))} style={iStyle()}/>
+          </div>
+          <div>
+            <div style={{fontSize:13,color:C.muted,marginBottom:6}}>Anything they shouldn't be asked?</div>
+            <input placeholder="e.g. Can't do South Indian..." value={s.cookWeaknesses||""} onChange={e=>setData(d=>({...d,cookWeaknesses:e.target.value}))} style={iStyle()}/>
+          </div>
+        </div>
+      )}
+    </OFrame>
+  );
+  if(step===8) return(
+    <OFrame step={step} title="What does eating well mean for your family right now?" sub="The most important question. Rasa honours this every single day." onNext={()=>{if(s.healthAmbition?.trim())onNext();}} onBack={onBack} canNext={!!s.healthAmbition?.trim()}>
+      <textarea placeholder="e.g. We want to eat healthier without it feeling like a diet. My father-in-law has diabetes. We want more variety. More home cooking, less ordering..." value={s.healthAmbition||""} onChange={e=>setData(d=>({...d,healthAmbition:e.target.value}))} rows={6} autoFocus style={iStyle({resize:"none",lineHeight:1.6})}/>
+    </OFrame>
+  );
+  if(step===9) return(
+    <div style={{minHeight:"100dvh",background:C.cream,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"0 28px",textAlign:"center"}}>
+      <div style={{fontSize:44,marginBottom:20}}>🌿</div>
+      <div style={{fontSize:22,fontWeight:600,color:C.stone,marginBottom:10}}>Rasa is learning your household</div>
+      <div style={{fontSize:14,color:C.muted,lineHeight:1.7,maxWidth:260,marginBottom:32}}>Generating your first meal plan. Thinking carefully about your family.</div>
+      <div style={{display:"flex",gap:8}}>{[0,.4,.8].map((d,i)=><div key={i} style={{width:8,height:8,borderRadius:4,background:C.green,animation:`pulse 1.2s ease-in-out ${d}s infinite`}}/>)}</div>
+    </div>
+  );
+  return null;
+}
+
+// ── Meal Card ─────────────────────────────────────────────────────
+function MealCard({slot,meal,status,onApprove,onChange,isChanging}){
+  const nc=NC[meal?.nutrition]||NC.balanced;
+  const emoji={breakfast:"☀️",lunch:"🌤️",dinner:"🌙"}[slot];
+  const label=slot.charAt(0).toUpperCase()+slot.slice(1);
+  const approved=status==="approved";
+  if(!meal) return(
+    <div style={{background:C.card,borderRadius:20,padding:20,border:`1px solid ${C.border}`,marginBottom:12}}>
+      <div style={{fontSize:12,color:C.muted,textTransform:"uppercase",letterSpacing:.5,marginBottom:8}}>{label}</div>
+      <div style={{fontSize:15,color:C.muted}}>Generating...</div>
+    </div>
+  );
+  return(
+    <div className="fade" style={{background:C.card,borderRadius:20,overflow:"hidden",marginBottom:12,border:`1px solid ${approved?C.greenMid:C.border}`,transition:"border-color .3s"}}>
+      <div style={{padding:"16px 18px 12px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <span style={{fontSize:15}}>{emoji}</span>
+            <span style={{fontSize:11,fontWeight:600,color:approved?C.green:C.muted,textTransform:"uppercase",letterSpacing:.5}}>{label}</span>
+          </div>
+          {approved&&<span style={{fontSize:12,color:C.green,fontWeight:500}}>✓ Approved</span>}
+        </div>
+        <div style={{fontSize:19,fontWeight:600,color:C.stone,marginBottom:8,lineHeight:1.25}}>{meal.name}</div>
+        <div style={{fontSize:13,color:C.muted,lineHeight:1.55,marginBottom:12,fontStyle:"italic"}}>"{meal.why}"</div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          <Tag bg={nc.bg} text={nc.text}>{nc.label}</Tag>
+          <Tag bg="#F5F4F0" text={C.muted}>{meal.prepMins} min</Tag>
+        </div>
+      </div>
+      {!approved&&(
+        <div style={{display:"flex",borderTop:`1px solid ${C.border}`}}>
+          <button onClick={onApprove} style={{flex:1,padding:"14px",fontSize:14,fontWeight:500,color:C.green,background:"transparent",border:"none",cursor:"pointer",borderRight:`1px solid ${C.border}`}}>✓ Looks good</button>
+          <button onClick={onChange} disabled={isChanging} style={{flex:1,padding:"14px",fontSize:14,color:isChanging?C.border:C.muted,background:"transparent",border:"none",cursor:isChanging?"default":"pointer"}}>
+            {isChanging?"Finding...":"↺ Change"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Nav ───────────────────────────────────────────────────────────
+function Nav({active,go}){
+  return(
+    <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,background:"rgba(250,248,243,0.96)",backdropFilter:"blur(12px)",borderTop:`1px solid ${C.border}`,display:"flex",paddingBottom:"env(safe-area-inset-bottom,12px)"}}>
+      {[{k:"home",l:"Today",e:"☀️"},{k:"history",l:"History",e:"📋"},{k:"profile",l:"Household",e:"🏠"}].map(it=>(
+        <button key={it.k} onClick={()=>go(it.k)} style={{flex:1,padding:"12px 0 4px",display:"flex",flexDirection:"column",alignItems:"center",gap:3,background:"transparent",border:"none",cursor:"pointer"}}>
+          <span style={{fontSize:20}}>{it.e}</span>
+          <span style={{fontSize:11,fontWeight:active===it.k?600:400,color:active===it.k?C.green:C.muted}}>{it.l}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── Home ──────────────────────────────────────────────────────────
+function Home({hh,plan,setPlan,history,setHistory,go}){
+  const [status,setStatus]=useState({breakfast:"pending",lunch:"pending",dinner:"pending"});
+  const [changing,setChanging]=useState(null);
+  const [shown,setShown]=useState({breakfast:[],lunch:[],dinner:[]});
+  const [done,setDone]=useState(false);
+  const [error,setError]=useState(null);
+
+  const allDone=Object.values(status).every(s=>s==="approved");
+  const count=Object.values(status).filter(s=>s==="approved").length;
+
+  const approve=(slot)=>{
+    setStatus(s=>({...s,[slot]:"approved"}));
+    if(plan[slot]){
+      const today=new Date().toLocaleDateString("en-IN");
+      setHistory(h=>[...h,{date:today,slot,dish:plan[slot].name,nutrition:plan[slot].nutrition}]);
+    }
+  };
+
+  const change=async(slot)=>{
+    setChanging(slot);
+    setError(null);
+    try{
+      const alt=await getAlt(plan[slot]?.name||"",slot,hh,history,shown[slot]);
+      setPlan(p=>({...p,[slot]:alt}));
+      setShown(s=>({...s,[slot]:[...s[slot],alt.name]}));
+      setStatus(s=>({...s,[slot]:"pending"}));
+    }catch(e){
+      console.error("Change failed:",e);
+      setError("Couldn't load alternative. Check your internet connection.");
+    }
+    setChanging(null);
+  };
+
+  const today=new Date().toLocaleDateString("en-IN",{weekday:"long",day:"numeric",month:"long"});
+  const hr=new Date().getHours();
+  const greeting=hr<12?"Good morning":hr<17?"Good afternoon":"Good evening";
+
+  return(
+    <div style={{minHeight:"100dvh",background:C.cream,display:"flex",flexDirection:"column"}}>
+      <div style={{padding:"20px 20px 0"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
+          <div>
+            <div style={{fontSize:13,color:C.muted}}>{greeting}</div>
+            <div style={{fontSize:22,fontWeight:700,color:C.stone,letterSpacing:"-0.5px"}}>{hh.familyName||"Your household"}</div>
+            <div style={{fontSize:12,color:C.muted,marginTop:2}}>{today}</div>
+          </div>
+          <div style={{fontSize:28,fontWeight:700,color:C.green,letterSpacing:"-2px"}}>rasa</div>
+        </div>
+        {!allDone&&(
+          <div style={{background:C.greenLight,borderRadius:14,padding:"12px 16px",marginBottom:16,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div>
+              <div style={{fontSize:13,fontWeight:500,color:C.green}}>Tomorrow's plan is ready</div>
+              <div style={{fontSize:12,color:C.greenMid,marginTop:1}}>{count}/3 meals approved</div>
+            </div>
+            <div style={{display:"flex",gap:4}}>{["breakfast","lunch","dinner"].map(s=><div key={s} style={{width:8,height:8,borderRadius:4,background:status[s]==="approved"?C.green:C.border}}/>)}</div>
+          </div>
+        )}
+        {error&&(
+          <div style={{background:"#FEE",borderRadius:12,padding:"10px 14px",marginBottom:12,fontSize:13,color:"#C00"}}>
+            {error}
+          </div>
+        )}
+      </div>
+      <div style={{flex:1,padding:"0 20px",overflowY:"auto",paddingBottom:110}}>
+        {["breakfast","lunch","dinner"].map(slot=>(
+          <MealCard key={slot} slot={slot} meal={plan[slot]} status={status[slot]} onApprove={()=>approve(slot)} onChange={()=>change(slot)} isChanging={changing===slot}/>
+        ))}
+        {allDone&&!done&&(
+          <div className="fade" style={{background:C.greenLight,borderRadius:20,padding:20,border:`1px solid ${C.greenMid}`,marginTop:4}}>
+            <div style={{fontSize:16,fontWeight:600,color:C.green,marginBottom:6}}>All meals approved ✓</div>
+            <div style={{fontSize:13,color:C.greenMid,marginBottom:16,lineHeight:1.5}}>Your morning is handled. The plan is set.</div>
+            <Btn onClick={()=>setDone(true)}>Save today's plan</Btn>
+          </div>
+        )}
+        {done&&(
+          <div className="fade" style={{background:C.greenLight,borderRadius:20,padding:20,textAlign:"center",border:`1px solid ${C.greenMid}`}}>
+            <div style={{fontSize:36,marginBottom:8}}>🌿</div>
+            <div style={{fontSize:16,fontWeight:600,color:C.green,marginBottom:4}}>Done. Your morning is free.</div>
+            <div style={{fontSize:13,color:C.greenMid,lineHeight:1.5}}>Plan saved. Rasa will have tomorrow's plan ready tonight.</div>
+          </div>
+        )}
+      </div>
+      <Nav active="home" go={go}/>
+    </div>
+  );
+}
+
+// ── History ───────────────────────────────────────────────────────
+function History({history,go}){
+  const grouped={};
+  history.forEach(h=>{if(!grouped[h.date])grouped[h.date]=[];grouped[h.date].push(h);});
+  const dates=Object.keys(grouped).reverse();
+  return(
+    <div style={{minHeight:"100dvh",background:C.cream,display:"flex",flexDirection:"column"}}>
+      <div style={{padding:"20px 20px 0"}}>
+        <div style={{fontSize:22,fontWeight:700,color:C.stone,marginBottom:4}}>Meal history</div>
+        <div style={{fontSize:13,color:C.muted,marginBottom:20}}>Rasa learns from every meal you eat.</div>
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"0 20px",paddingBottom:100}}>
+        {dates.length===0&&(
+          <div style={{textAlign:"center",paddingTop:60}}>
+            <div style={{fontSize:40,marginBottom:12}}>🌱</div>
+            <div style={{fontSize:15,color:C.muted,lineHeight:1.6,maxWidth:260,margin:"0 auto"}}>Your history appears here as you approve meals.</div>
+          </div>
+        )}
+        {dates.map(date=>(
+          <div key={date} style={{marginBottom:20}}>
+            <div style={{fontSize:11,fontWeight:600,color:C.muted,textTransform:"uppercase",letterSpacing:.5,marginBottom:8}}>{date}</div>
+            <div style={{background:C.card,borderRadius:16,overflow:"hidden",border:`1px solid ${C.border}`}}>
+              {grouped[date].map((h,i)=>{
+                const nc=NC[h.nutrition]||NC.balanced;
+                const emoji={breakfast:"☀️",lunch:"🌤️",dinner:"🌙"}[h.slot];
+                return(
+                  <div key={i} style={{padding:"14px 16px",borderBottom:i<grouped[date].length-1?`1px solid ${C.border}`:"none",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10}}>
+                      <span style={{fontSize:16}}>{emoji}</span>
+                      <div>
+                        <div style={{fontSize:14,fontWeight:500,color:C.stone}}>{h.dish}</div>
+                        <div style={{fontSize:12,color:C.muted,textTransform:"capitalize"}}>{h.slot}</div>
+                      </div>
+                    </div>
+                    <Tag bg={nc.bg} text={nc.text}>{nc.label}</Tag>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+      <Nav active="history" go={go}/>
+    </div>
+  );
+}
+
+// ── Profile ───────────────────────────────────────────────────────
+function Profile({hh,go,onReset}){
+  const rows=[
+    {l:"Household",v:hh.familyName||(hh.sizeLabel||hh.size+" people")},
+    {l:"Diet",v:{veg:"Vegetarian",jain:"Jain",egg:"Eggetarian",nonveg:"Non-vegetarian","no-og":"No onion/garlic"}[hh.dietType]||hh.dietType},
+    {l:"Cuisine",v:{north:"North Indian",south:"South Indian",gujarati:"Gujarati",bengali:"Bengali",punjabi:"Punjabi",mixed:"Mixed"}[hh.cuisinePrimary]},
+    {l:"Cook",v:hh.hasCook===true?`Yes, arrives ${hh.cookArrivalTime||"8am"}`:hh.hasCook==="sometimes"?"Sometimes":"No cook"},
+    {l:"Health goal",v:hh.healthAmbition},
+    {l:"Loves more of",v:hh.lovesMoreOf},
+    {l:"Never suggest",v:[hh.neverSuggest,...(hh.neverSuggestTags||[])].filter(Boolean).join(", ")||"Nothing specific"},
+    {l:"Dietary notes",v:hh.dietaryNotes},
+  ];
+  return(
+    <div style={{minHeight:"100dvh",background:C.cream,display:"flex",flexDirection:"column"}}>
+      <div style={{padding:"20px 20px 0"}}>
+        <div style={{fontSize:22,fontWeight:700,color:C.stone,marginBottom:4}}>Your household</div>
+        <div style={{fontSize:13,color:C.muted,marginBottom:20}}>This is what Rasa knows about you.</div>
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"0 20px",paddingBottom:100}}>
+        <div style={{background:C.card,borderRadius:16,overflow:"hidden",border:`1px solid ${C.border}`,marginBottom:16}}>
+          {rows.filter(r=>r.v).map((row,i,arr)=>(
+            <div key={i} style={{padding:"14px 16px",borderBottom:i<arr.length-1?`1px solid ${C.border}`:"none"}}>
+              <div style={{fontSize:11,fontWeight:600,color:C.muted,textTransform:"uppercase",letterSpacing:.5,marginBottom:4}}>{row.l}</div>
+              <div style={{fontSize:14,color:C.stone,lineHeight:1.4}}>{row.v}</div>
+            </div>
+          ))}
+        </div>
+        <button onClick={onReset} style={{width:"100%",padding:"15px",borderRadius:14,fontSize:14,color:C.muted,border:`1px solid ${C.border}`,background:"transparent",cursor:"pointer",marginBottom:12}}>Update household profile</button>
+        <div style={{fontSize:12,color:C.muted,textAlign:"center",lineHeight:1.6}}>Rasa gets smarter with every meal you approve or change.</div>
+      </div>
+      <Nav active="profile" go={go}/>
+    </div>
+  );
+}
+
+// ── Generating ────────────────────────────────────────────────────
+function Generating(){
+  const msgs=["Thinking about your household...","Checking what you have eaten recently...","Considering your health goals...","Almost ready..."];
+  const [msg,setMsg]=useState(msgs[0]);
+  useEffect(()=>{let i=0;const t=setInterval(()=>{i=(i+1)%msgs.length;setMsg(msgs[i]);},1800);return()=>clearInterval(t);},[]);
+  return(
+    <div style={{minHeight:"100dvh",background:C.cream,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"0 28px",textAlign:"center"}}>
+      <div style={{fontSize:44,marginBottom:20}}>🌿</div>
+      <div style={{fontSize:20,fontWeight:600,color:C.stone,marginBottom:10}}>Preparing your first plan</div>
+      <div style={{fontSize:14,color:C.muted,lineHeight:1.7,marginBottom:28,minHeight:48}}>{msg}</div>
+      <div style={{display:"flex",gap:8}}>{[0,.4,.8].map((d,i)=><div key={i} style={{width:8,height:8,borderRadius:4,background:C.green,animation:`pulse 1.2s ease-in-out ${d}s infinite`}}/>)}</div>
+    </div>
+  );
+}
+
+// ── Root App ──────────────────────────────────────────────────────
+function App(){
+  const [appState,setAppState]=useState("loading");
+  const [step,setStep]=useState(0);
+  const [hh,setHH]=useState({});
+  const [plan,setPlan]=useState(null);
+  const [history,setHistory]=useState([]);
+  const [screen,setScreen]=useState("home");
+
+  useEffect(()=>{store.set("rasa:history",history);},[history]);
+
+  useEffect(()=>{
+    const saved=store.get("rasa:household");
+    const savedHist=store.get("rasa:history");
+    if(savedHist)setHistory(savedHist);
+    if(saved?.onboardingDone){
+      setHH(saved);
+      const savedPlan=store.get("rasa:plan:today");
+      if(savedPlan){setPlan(savedPlan);setAppState("home");}
+      else{setAppState("generating");doGenerate(saved,savedHist||[]);}
+    }else{
+      setAppState("onboarding");
+    }
+  },[]);
+
+  const doGenerate=useCallback(async(household,hist)=>{
+    try{
+      const p=await generatePlan(household,hist);
+      setPlan(p);
+      store.set("rasa:plan:today",p);
+      setAppState("home");
+    }catch(e){
+      console.error("Generation failed:",e);
+      setPlan({
+        breakfast:{name:"Poha with peanuts",prepMins:20,nutrition:"light",why:"A light, nourishing start — easy to make and gentle on the stomach."},
+        lunch:{name:"Dal makhani + roti",prepMins:40,nutrition:"protein",why:"Slow-cooked and deeply satisfying — carries you through the afternoon."},
+        dinner:{name:"Palak paneer + jeera rice",prepMins:35,nutrition:"balanced",why:"Iron from the palak, protein from the paneer. A quietly perfect dinner."},
+      });
+      setAppState("home");
+    }
+  },[]);
+
+  const handleNext=async()=>{
+    if(step<8){setStep(s=>s+1);}
+    else if(step===8){
+      setStep(9);
+      const final={...hh,onboardingDone:true,familyName:hh.familyName||"Your household"};
+      setHH(final);
+      store.set("rasa:household",final);
+      await doGenerate(final,history);
+    }
+  };
+
+  const reset=()=>{
+    store.set("rasa:household",null);
+    store.set("rasa:plan:today",null);
+    setHH({});setPlan(null);setStep(0);setAppState("onboarding");
+  };
+
+  if(appState==="loading") return <div style={{minHeight:"100dvh",background:C.cream,display:"flex",alignItems:"center",justifyContent:"center"}}><div style={{fontSize:42,fontWeight:700,color:C.green,letterSpacing:"-2px"}}>rasa</div></div>;
+  if(appState==="onboarding") return <Onboarding step={step} data={hh} setData={setHH} onNext={handleNext} onBack={()=>step>0&&setStep(s=>s-1)}/>;
+  if(appState==="generating") return <Generating/>;
+  if(appState==="home"){
+    if(screen==="home") return <Home hh={hh} plan={plan} setPlan={setPlan} history={history} setHistory={setHistory} go={setScreen}/>;
+    if(screen==="history") return <History history={history} go={setScreen}/>;
+    if(screen==="profile") return <Profile hh={hh} go={setScreen} onReset={reset}/>;
+  }
+  return null;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
